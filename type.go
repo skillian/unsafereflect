@@ -69,7 +69,7 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 			t.uintData[0] = (uint(t.ReflectType().Len()) << uintDataBits) | udIsArrayBit | udHasLenMask
 		})
 		fallthrough
-	case reflect.Slice, reflect.Pointer, reflect.UnsafePointer:
+	case reflect.Slice, reflect.Pointer:
 		// elem type
 		numFields++
 		initFuncs = append(initFuncs, func(t *Type) {
@@ -222,6 +222,9 @@ func (t *Type) field(
 	fieldIndex int,
 	fieldTypesSelector func(*Type) []unsafe.Pointer,
 ) (field interface{}) {
+	if t.ReflectType().Kind() == reflect.Pointer {
+		t = t.FieldType(0)
+	}
 	strucID := InterfaceDataOf(unsafe.Pointer(&struc))
 	if strucID.Type != *t.abiType() && strucID.Type != *t.abiPtrType() {
 		panic(fmt.Sprintf(
