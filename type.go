@@ -2,6 +2,7 @@ package unsafereflect
 
 import (
 	"fmt"
+	"math/bits"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -338,6 +339,31 @@ func appendFields(
 	return slice
 }
 
+// Copy is like
+//
+//	func Copy[T any](dest, src *T) int {
+//		*dest = *src
+//		return int(unsafe.Sizeof(*dest))
+//	}
+//
+// # Except that it works with non-generic parameters
+//
+// The way this works is by copying the bytes from src into dest.
+// If src contains a noCopy type, you will introduce undefined behavior
+// into your code.
+func Copy(dest, src interface{}) (bytesCopied int) {
+	destType, destMemory := typeAndMemoryOf(dest)
+	srcType, srcMemory := typeAndMemoryOf(src)
+	if destType != srcType {
+		panic(fmt.Errorf(
+			"%[1]v (type: %[1]T) is incompatible with "+
+				"%[1]v (type: %[2]T)",
+			dest, src,
+		))
+	}
+	return copy(destMemory, srcMemory)
+}
+
 // InterfaceData allows you to access the implementation of interface
 // values' type and data pointers.  This will break if Go ever changes
 // the implementation of interfaces.
@@ -363,6 +389,62 @@ func Len(v interface{}) int {
 	return 0
 }
 
+var (
+	atomicLoadInt, atomicStoreInt = func() (func(*int) int, func(*int, int)) {
+		switch bits.UintSize {
+		case 64:
+			return func(i *int) int {
+					return int(atomic.LoadInt64((*int64)(unsafe.Pointer(i))))
+				}, func(i1 *int, i2 int) {
+					atomic.StoreInt64((*int64)(unsafe.Pointer(i1)), int64(i2))
+				}
+		case 32:
+			return func(i *int) int {
+					return int(atomic.LoadInt32((*int32)(unsafe.Pointer(i))))
+				}, func(i1 *int, i2 int) {
+					atomic.StoreInt32((*int32)(unsafe.Pointer(i1)), int32(i2))
+				}
+		default:
+			panic(fmt.Errorf("unknown bit size: %d", bits.UintSize))
+		}
+	}()
+	zeroData = func() unsafe.Pointer {
+		var v interface{} = []int{0}
+		id := InterfaceDataOf(unsafe.Pointer(&v))
+		sd := SliceDataOf(id.Data)
+		return sd.Data
+	}()
+)
+
+// MemoryOf exposes the bytes of a value as a byte slice.  Pass in
+// a pointer to the memory you want.
+func MemoryOf(v interface{}) (memory []byte) {
+	_, memory = typeAndMemoryOf(v)
+	return
+}
+
+func typeAndMemoryOf(v interface{}) (t *Type, memory []byte) {
+	// this function uses atomic operations because it is my
+	// understanding that the state of interfaces must be valid
+	// at all points in time in case the runtime preempts the
+	// goroutine.
+	t = TypeOf(v)
+	id := InterfaceDataOf(unsafe.Pointer(&v))
+	// if t.ReflectType().Kind() == reflect.Pointer {
+	// 	data := id.Data
+	// 	atomic.StorePointer(&id.Data, zeroData)
+	// 	atomic.StorePointer(&id.Type, t.fieldABITypes()[0])
+	// 	atomic.StorePointer(&id.Data, *(*unsafe.Pointer)(data))
+	// 	t = t.fieldUSRTypes()[0]
+	// }
+	sd := SliceDataOf(unsafe.Pointer(&memory))
+	atomic.StorePointer(&sd.Data, id.Data)
+	size := t.fieldUSRTypes()[0].Size()
+	atomicStoreInt(&sd.Cap, size)
+	atomicStoreInt(&sd.Len, size)
+	return
+}
+
 type SliceData struct {
 	Data unsafe.Pointer
 	Len  int
@@ -371,4 +453,13 @@ type SliceData struct {
 
 func SliceDataOf(v unsafe.Pointer) *SliceData {
 	return (*SliceData)(v)
+}
+
+type StringData struct {
+	Data unsafe.Pointer
+	Len  int
+}
+
+func StringDataOf(s *string) *StringData {
+	return (*StringData)(unsafe.Pointer(s))
 }

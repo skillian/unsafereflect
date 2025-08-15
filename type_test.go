@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"unsafe"
 
 	"github.com/skillian/unsafereflect"
 )
@@ -197,5 +198,48 @@ func TestUnsafeSlice(t *testing.T) {
 				i, &sl[i], psl[i],
 			)
 		}
+	}
+}
+
+func TestCopy(t *testing.T) {
+	type S struct {
+		I int
+		F float64
+		S string
+		A [3]bool
+	}
+	s := &S{
+		I: 123,
+		F: 45.6,
+		S: "test",
+		A: [...]bool{false, false, true},
+	}
+	s2 := (*S)(nil)
+	b := unsafereflect.Copy(&s2, &s)
+	if uintptr(b) != unsafe.Sizeof(s2) {
+		t.Fatalf(
+			"expected to copy a pointer (%d) bytes, not %d",
+			unsafe.Sizeof(s2), b,
+		)
+	}
+	if s2 != s {
+		t.Fatalf(
+			"expected s2 (%p) = s (%p)",
+			s2, s,
+		)
+	}
+	var s3 S
+	b = unsafereflect.Copy(&s3, s)
+	if uintptr(b) != unsafe.Sizeof(s3) {
+		t.Fatalf(
+			"expected to copy S struct (%d bytes), actual: %d",
+			unsafe.Sizeof(s3), b,
+		)
+	}
+	if s3 != *s {
+		t.Fatalf(
+			"expected *s:\n\t%#v\n = s3:\n\t%#v",
+			*s, s3,
+		)
 	}
 }
