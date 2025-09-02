@@ -67,7 +67,7 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 	switch rt.Kind() {
 	case reflect.Array:
 		initFuncs = append(initFuncs, func(t *Type) {
-			t.uintData[0] = (uint(t.ReflectType().Len()) << uintDataBits) | udIsArrayBit | udHasLenMask
+			t.uintData[0] = (uint(t.ReflectType().Len()) << uintDataBits) | udIsArrayMask
 		})
 		fallthrough
 	case reflect.Slice, reflect.Pointer:
@@ -151,18 +151,18 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 	ptrToFieldABITypes := t.ptrToFieldABITypes()
 	fieldUSRTypes := t.fieldUSRTypes()
 	ptrToFieldUSRTypes := t.ptrToFieldUSRTypes()
-	numFields = t.numFields()
-	if len(fieldABITypes) != numFields {
-		panic("len(fieldABITypes) != t.numFields")
+	numTypes := t.numTypes()
+	if len(fieldABITypes) != numTypes {
+		panic("len(fieldABITypes) != t.numTypes")
 	}
-	if len(ptrToFieldABITypes) != numFields {
-		panic("len(ptrToFieldABITypes) != t.numFields")
+	if len(ptrToFieldABITypes) != numTypes {
+		panic("len(ptrToFieldABITypes) != t.numTypes")
 	}
-	if len(fieldUSRTypes) != numFields {
-		panic("len(fieldUSRTypes) != t.numFields")
+	if len(fieldUSRTypes) != numTypes {
+		panic("len(fieldUSRTypes) != t.numTypes")
 	}
-	if len(ptrToFieldUSRTypes) != numFields {
-		panic("len(ptrToFieldUSRTypes) != t.numFields")
+	if len(ptrToFieldUSRTypes) != numTypes {
+		panic("len(ptrToFieldUSRTypes) != t.numTypes")
 	}
 	for _, initFunc := range initFuncs {
 		initFunc(t)
@@ -253,7 +253,8 @@ func (t *Type) abiPtrType() *unsafe.Pointer {
 }
 
 func (t *Type) fieldABITypes() []unsafe.Pointer {
-	return unsafe.Slice(t.unsafePointers(), 2+t.numFields())[2:]
+	numTypes := t.numTypes()
+	return unsafe.Slice(t.unsafePointers(), 2+numTypes)[2:]
 }
 
 func (t *Type) fieldIndexMultiplier() int {
@@ -267,18 +268,22 @@ func (t *Type) fieldOffset(i int) int {
 
 func (t *Type) fieldUSRTypes() []*Type {
 	ptrs := (**Type)(unsafe.Pointer(t.unsafePointers()))
-	return unsafe.Slice(ptrs, 2+(usrPtrType*t.numFields()))[2+(usrType*t.numFields()):]
+	numTypes := t.numTypes()
+	return unsafe.Slice(ptrs, 2+(usrPtrType*numTypes))[2+(usrType*numTypes):]
 }
 
 func (t *Type) numFields() int { return int(t.uintData[0] >> uintDataBits) }
+func (t *Type) numTypes() int  { return (t.numFields()-1)*t.fieldIndexMultiplier() + 1 }
 
 func (t *Type) ptrToFieldABITypes() []unsafe.Pointer {
-	return unsafe.Slice(t.unsafePointers(), 2+(usrType*t.numFields()))[2+(abiPtrType*t.numFields()):]
+	numTypes := t.numTypes()
+	return unsafe.Slice(t.unsafePointers(), 2+(usrType*numTypes))[2+(abiPtrType*numTypes):]
 }
 
 func (t *Type) ptrToFieldUSRTypes() []*Type {
 	ptrs := (**Type)(unsafe.Pointer(t.unsafePointers()))
-	return unsafe.Slice(ptrs, 2+(typeUnsafePointers*t.numFields()))[2+(usrPtrType*t.numFields()):]
+	numTypes := t.numTypes()
+	return unsafe.Slice(ptrs, 2+(typeUnsafePointers*numTypes))[2+(usrPtrType*numTypes):]
 }
 
 func (t *Type) unsafePointers() *unsafe.Pointer {
@@ -379,7 +384,7 @@ func InterfaceDataOf(v unsafe.Pointer) *InterfaceData {
 
 func Len(v interface{}) int {
 	t := TypeOf(v)
-	if t.uintData[0]&udHasLenMask == udHasLenMask {
+	if t.uintData[0]&(udIsArrayMask|udHasLenMask) != 0 {
 		return t.numFields()
 	}
 	if t.ReflectType().Kind() == reflect.Slice {

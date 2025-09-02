@@ -185,6 +185,22 @@ func TestExampleUnsafeUsage(t *testing.T) {
 	//
 }
 
+func TestUnsafeArray(t *testing.T) {
+	sl := new([10]int)
+	for i := range *sl {
+		(*sl)[i] = i
+	}
+	psl := unsafereflect.AppendFieldPointers(make([]interface{}, 0, len(*sl)), sl)
+	for i := range *sl {
+		if &(*sl)[i] != psl[i] {
+			t.Fatalf(
+				"Slice element ptr %[1]d: %[2]v (%[2]p) != %[3]v (%[3]p)",
+				i, &(*sl)[i], psl[i],
+			)
+		}
+	}
+}
+
 func TestUnsafeSlice(t *testing.T) {
 	sl := make([]int, 10)
 	for i := range sl {
