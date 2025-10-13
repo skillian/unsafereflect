@@ -382,6 +382,8 @@ func InterfaceDataOf(v unsafe.Pointer) *InterfaceData {
 	return (*InterfaceData)(v)
 }
 
+// Len gets the length of a slice or array or the number of fields
+// of a struct.
 func Len(v interface{}) int {
 	t := TypeOf(v)
 	if t.uintData[0]&(udIsArrayMask|udHasLenMask) != 0 {
