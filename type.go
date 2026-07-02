@@ -9,6 +9,13 @@ import (
 	"unsafe"
 )
 
+const (
+	// Checked indicates if the unsafereflect module is compiled
+	// to perform runtime checks.  Set this to false before
+	// compilation to remove runtime checks.
+	Checked = true
+)
+
 type Type struct {
 	// reflectType is the reflect.Type that this *Type was created
 	// from
@@ -58,32 +65,57 @@ func TypeOf(v interface{}) *Type {
 
 // TypeFromReflectType gets the unsafe reflect type from a reflect.Type.
 func TypeFromReflectType(rt reflect.Type) (t *Type) {
+	if rt == nil {
+		panic("cannot get type of nil")
+	}
 	key := interface{}(rt)
 	if v, loaded := types.Load(key); loaded {
 		return v.(*Type)
 	}
+	defer func() {
+		var err error
+		switch v := recover().(type) {
+		case error:
+			err = v
+		default:
+			if v == nil {
+				return
+			}
+			err = fmt.Errorf("%#v", v)
+		}
+		panic(fmt.Errorf(
+			"unsafereflect.Type of %v: %w",
+			rt, err,
+		))
+	}()
 	numFields := 0
 	initFuncs := make([]func(t *Type), 0, 2)
-	switch rt.Kind() {
+	handleArraySliceAndPointer := func(t *Type) {
+		elemType := TypeFromReflectType(t.ReflectType().Elem())
+		sfs := t.ReflectStructFields()
+		sfs[0] = reflect.StructField{
+			Name: "Elem",
+			Type: elemType.ReflectType(),
+		}
+		t.fieldABITypes()[0] = *elemType.abiType()
+		t.ptrToFieldABITypes()[0] = *elemType.abiPtrType()
+		t.fieldUSRTypes()[0] = elemType
+		t.ptrToFieldUSRTypes()[0] = TypeFromReflectType(reflect.PointerTo(elemType.ReflectType()))
+	}
+	kind := rt.Kind()
+	switch kind {
 	case reflect.Array:
+		numFields++
 		initFuncs = append(initFuncs, func(t *Type) {
 			t.uintData[0] = (uint(t.ReflectType().Len()) << uintDataBits) | udIsArrayMask
 		})
-		fallthrough
+		initFuncs = append(initFuncs, handleArraySliceAndPointer)
 	case reflect.Slice, reflect.Pointer:
-		// elem type
 		numFields++
 		initFuncs = append(initFuncs, func(t *Type) {
-			elemType := TypeFromReflectType(t.ReflectType().Elem())
-			t.ReflectStructFields()[0] = reflect.StructField{
-				Name: "Elem",
-				Type: elemType.ReflectType(),
-			}
-			t.fieldABITypes()[0] = *elemType.abiType()
-			t.ptrToFieldABITypes()[0] = *elemType.abiPtrType()
-			t.fieldUSRTypes()[0] = elemType
-			t.ptrToFieldUSRTypes()[0] = TypeFromReflectType(reflect.PointerTo(elemType.ReflectType()))
+			t.uintData[0] |= udIsArrayMask | udHasLenMask
 		})
+		initFuncs = append(initFuncs, handleArraySliceAndPointer)
 	case reflect.Struct:
 		// field types + ptr to field types
 		numFields += rt.NumField()
@@ -94,9 +126,9 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 			fieldUSRTypes := t.fieldUSRTypes()
 			ptrToFieldUSRTypes := t.ptrToFieldUSRTypes()
 			rt := t.ReflectType()
-			numFields := t.numFields()
+			numTypes := t.numTypes()
 			reflectStructFields := t.ReflectStructFields()
-			for i := 0; i < numFields; i++ {
+			for i := 0; i < numTypes; i++ {
 				reflectStructFields[i] = rt.Field(i)
 				fieldUSRTypes[i] = TypeFromReflectType(reflectStructFields[i].Type)
 				ptrToFieldABITypes[i] = *fieldUSRTypes[i].abiPtrType()
@@ -119,7 +151,7 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 	{
 		rv := reflect.New(rt)
 		v := rv.Interface()
-		id := InterfaceDataOf(unsafe.Pointer(&v))
+		id := InterfaceDataOf(&v)
 		*t.abiPtrType() = id.Type
 		v = rv.Elem().Interface()
 		*t.abiType() = id.Type
@@ -128,24 +160,8 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 	if v, loaded := types.LoadOrStore(key, t); loaded {
 		return v.(*Type)
 	}
-	tReflectStructFields := t.ReflectStructFields()
-	tvReflectStructFields := tv.Elem().Field(2).Slice(0, numFields).Interface().([]reflect.StructField)
-	if len(tReflectStructFields) != len(tvReflectStructFields) {
-		panic(fmt.Sprintf(
-			"len(tReflectStructFields) (%d) != "+
-				"len(tvReflectStructFields) (%d)",
-			len(tReflectStructFields),
-			len(tvReflectStructFields),
-		))
-	}
-	if len(tReflectStructFields) > 0 && &tReflectStructFields[0] != &tvReflectStructFields[0] {
-		panic(fmt.Sprintf(
-			"&tReflectStructFields[0] (%p) != "+
-				"&tvReflectStructFields[0] (%p) = (%x)",
-			&tReflectStructFields[0],
-			&tvReflectStructFields[0],
-			uintptr(unsafe.Pointer(&tvReflectStructFields[0]))-uintptr(unsafe.Pointer(&tReflectStructFields[0])),
-		))
+	for _, initFunc := range initFuncs {
+		initFunc(t)
 	}
 	fieldABITypes := t.fieldABITypes()
 	ptrToFieldABITypes := t.ptrToFieldABITypes()
@@ -164,8 +180,24 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 	if len(ptrToFieldUSRTypes) != numTypes {
 		panic("len(ptrToFieldUSRTypes) != t.numTypes")
 	}
-	for _, initFunc := range initFuncs {
-		initFunc(t)
+	tReflectStructFields := t.ReflectStructFields()
+	tvReflectStructFields := tv.Elem().Field(2).Slice(0, t.numTypes()).Interface().([]reflect.StructField)
+	if len(tReflectStructFields) != len(tvReflectStructFields) {
+		panic(fmt.Sprintf(
+			"len(tReflectStructFields) (%d) != "+
+				"len(tvReflectStructFields) (%d)",
+			len(tReflectStructFields),
+			len(tvReflectStructFields),
+		))
+	}
+	if len(tReflectStructFields) > 0 && &tReflectStructFields[0] != &tvReflectStructFields[0] {
+		panic(fmt.Sprintf(
+			"&tReflectStructFields[0] (%p) != "+
+				"&tvReflectStructFields[0] (%p) = (%x)",
+			&tReflectStructFields[0],
+			&tvReflectStructFields[0],
+			uintptr(unsafe.Pointer(&tvReflectStructFields[0]))-uintptr(unsafe.Pointer(&tReflectStructFields[0])),
+		))
 	}
 	return
 }
@@ -186,7 +218,7 @@ func (t *Type) FieldType(fieldIndex int) *Type {
 // Len gets the number of fields if the Type is a struct or the number
 // of elements if it is an array.  Otherwise, the return value is
 // undefined.
-func (t *Type) Len() int { return t.numFields() }
+func (t *Type) Len() int { return int(t.uintData[0] >> uintDataBits) }
 
 // ReflectStructFields returns a borrowed slice of reflect.StructField
 // of all of the type's struct fields.  Do not mutate the elements of
@@ -195,19 +227,31 @@ func (t *Type) Len() int { return t.numFields() }
 // array or slice.
 func (t *Type) ReflectStructFields() []reflect.StructField {
 	ups := t.unsafePointers()
-	numFields := t.numFields()
+	numTypes := t.numTypes()
 	return unsafe.Slice(
-		(*reflect.StructField)(unsafe.Add(unsafe.Pointer(ups), (2+numFields*typeUnsafePointers)*int(unsafe.Sizeof(unsafe.Pointer(nil))))),
-		numFields,
+		(*reflect.StructField)(unsafe.Add(unsafe.Pointer(ups), (2+numTypes*typeUnsafePointers)*int(unsafe.Sizeof(unsafe.Pointer(nil))))),
+		numTypes,
 	)
 }
 
+// ReflecType gets the Go reflect.Type that this unsafereflect.Type
+// wraps
 func (t *Type) ReflectType() reflect.Type {
 	return t.reflectType
 }
 
 // Size of the type
 func (t *Type) Size() int { return t.size }
+
+// UnsafeDeref returns the same underlying memory as was passed into
+// ptr but its type is changed from *T to T.
+func (t *Type) UnsafeDeref(ptr any) any {
+	id := InterfaceDataOf(&ptr)
+	if id.Type == *t.abiPtrType() {
+		atomic.StorePointer(&id.Type, *t.abiType())
+	}
+	return ptr
+}
 
 // UnsafeFieldValue will return an interface{} of the value of the
 // field of struct at the given field index.  Note that the backing
@@ -226,7 +270,7 @@ func (t *Type) field(
 	if t.ReflectType().Kind() == reflect.Pointer {
 		t = t.FieldType(0)
 	}
-	strucID := InterfaceDataOf(unsafe.Pointer(&struc))
+	strucID := InterfaceDataOf(&struc)
 	if strucID.Type != *t.abiType() && strucID.Type != *t.abiPtrType() {
 		panic(fmt.Sprintf(
 			"cannot get field of %T with %v",
@@ -235,16 +279,19 @@ func (t *Type) field(
 	}
 	base := strucID.Data
 	if t.ReflectType().Kind() == reflect.Slice {
-		base = SliceDataOf(strucID.Data).Data
+		base = SliceDataOf((*[]any)(strucID.Data)).Data
 	}
-	fID := InterfaceDataOf(unsafe.Pointer(&field))
-	atomic.StorePointer(&fID.Type, fieldTypesSelector(t)[fieldIndex*t.fieldIndexMultiplier()])
+	fID := InterfaceDataOf(&field)
+	atomic.StorePointer(&fID.Type, fieldTypesSelector(t)[fieldIndex&^t.notFieldLengthMask()])
 	atomic.StorePointer(
 		&fID.Data,
 		unsafe.Add(base, t.fieldOffset(fieldIndex)),
 	)
 	return
 }
+
+// ABIType gets the Go ABI type pointer
+func (t *Type) ABIType() unsafe.Pointer { return *t.abiType() }
 
 func (t *Type) abiType() *unsafe.Pointer { return t.unsafePointers() }
 
@@ -257,13 +304,27 @@ func (t *Type) fieldABITypes() []unsafe.Pointer {
 	return unsafe.Slice(t.unsafePointers(), 2+numTypes)[2:]
 }
 
-func (t *Type) fieldIndexMultiplier() int {
-	return int((t.uintData[0] >> udHasLenBit) & 1)
+// notFieldLengthMask is:
+//
+//	-1 for array and slice types or
+//	0 for struct types.
+//
+// For arrays and slices, there is only one field
+// defined in the Type, so when you access the field information for
+// index 100, it accesses fieldInfo[100&^notFieldLengthMask] = fieldInfo[0]
+func (t *Type) notFieldLengthMask() int {
+	return int((t.uintData[0]&udHasLenMask)>>udHasLenBit) - 1
+}
+func (t *Type) notArrayLengthMask() int {
+	return int((t.uintData[0]&udIsArrayMask)>>udIsArrayBit) - 1
 }
 
 func (t *Type) fieldOffset(i int) int {
-	m := t.fieldIndexMultiplier()
-	return int(t.ReflectStructFields()[i*m].Offset) + (i*int((^m)&1))*t.fieldUSRTypes()[0].size
+	fieldLengthMask := ^t.notFieldLengthMask()
+	arrayLengthMask := ^t.notArrayLengthMask()
+	sliceLengthMask := fieldLengthMask & arrayLengthMask
+	return int(t.ReflectStructFields()[i&(fieldLengthMask^sliceLengthMask)].Offset) +
+		t.fieldUSRTypes()[0].size*(i&(arrayLengthMask|sliceLengthMask))
 }
 
 func (t *Type) fieldUSRTypes() []*Type {
@@ -272,8 +333,16 @@ func (t *Type) fieldUSRTypes() []*Type {
 	return unsafe.Slice(ptrs, 2+(usrPtrType*numTypes))[2+(usrType*numTypes):]
 }
 
-func (t *Type) numFields() int { return int(t.uintData[0] >> uintDataBits) }
-func (t *Type) numTypes() int  { return (t.numFields()-1)*t.fieldIndexMultiplier() + 1 }
+// numTypes returns 1 for arrays and slices (the element type) or
+// the number of fields.
+func (t *Type) numTypes() int {
+	length := t.Len()
+	fieldLengthMask := ^t.notFieldLengthMask()
+	arrayLengthMask := ^t.notArrayLengthMask()
+	pointerIndexMask := fieldLengthMask & arrayLengthMask
+	return (length & (fieldLengthMask ^ pointerIndexMask)) +
+		(1 & (arrayLengthMask | pointerIndexMask))
+}
 
 func (t *Type) ptrToFieldABITypes() []unsafe.Pointer {
 	numTypes := t.numTypes()
@@ -320,24 +389,24 @@ func appendFields(
 	structPointers ...interface{},
 ) []interface{} {
 	var v interface{}
-	id := InterfaceDataOf(unsafe.Pointer(&v))
+	id := InterfaceDataOf(&v)
 	for _, st := range structPointers {
 		structType := TypeOf(st)
 		structKind := structType.ReflectType().Kind()
 		if structKind == reflect.Pointer {
 			structType = structType.fieldUSRTypes()[0]
 			structKind = structType.ReflectType().Kind()
-			InterfaceDataOf(unsafe.Pointer(&st)).Type = *structType.abiType()
+			InterfaceDataOf(&st).Type = *structType.abiType()
 		}
 		types := fieldsSelector(structType)
-		base := InterfaceDataOf(unsafe.Pointer(&st)).Data
+		base := InterfaceDataOf(&st).Data
 		if structKind == reflect.Slice {
-			base = SliceDataOf(base).Data
+			base = SliceDataOf((*[]any)(base)).Data
 		}
-		m := structType.fieldIndexMultiplier()
+		m := (^structType.notFieldLengthMask()) & structType.notArrayLengthMask()
 		for i, length := 0, Len(st); i < length; i++ {
 			id.Data = unsafe.Add(base, structType.fieldOffset(i))
-			id.Type = types[i*m]
+			id.Type = types[i&m]
 			slice = append(slice, v)
 		}
 	}
@@ -356,6 +425,9 @@ func appendFields(
 // The way this works is by copying the bytes from src into dest.
 // If src contains a noCopy type, you will introduce undefined behavior
 // into your code.
+//
+// Note that this also doesn't put memory barriers around writing
+// pointers. Use at your own risk.
 func Copy(dest, src interface{}) (bytesCopied int) {
 	destType, destMemory := typeAndMemoryOf(dest)
 	srcType, srcMemory := typeAndMemoryOf(src)
@@ -378,19 +450,33 @@ type InterfaceData struct {
 }
 
 // InterfaceDataOf must always be passed a pointer to an interface.
-func InterfaceDataOf(v unsafe.Pointer) *InterfaceData {
-	return (*InterfaceData)(v)
+func InterfaceDataOf[T any](v *T) *InterfaceData {
+	if Checked {
+		t := reflect.TypeFor[T]()
+		if t.Kind() != reflect.Interface {
+			panic(fmt.Errorf(
+				// TODO: Is there a better way to get the type
+				// representation in case of non-defined types?
+				"InterfaceDataOf can only get InterfaceData of interfaces, not %T",
+				reflect.New(t).Elem(),
+			))
+		}
+	}
+	return (*InterfaceData)(unsafe.Pointer(v))
 }
 
 // Len gets the length of a slice or array or the number of fields
 // of a struct.
 func Len(v interface{}) int {
 	t := TypeOf(v)
-	if t.uintData[0]&(udIsArrayMask|udHasLenMask) != 0 {
-		return t.numFields()
+	ud := t.uintData[0]
+	a := (ud & udIsArrayMask) >> udIsArrayBit
+	b := (ud & udHasLenMask) >> udHasLenBit
+	if (a ^ b) != 0 {
+		return t.Len()
 	}
 	if t.ReflectType().Kind() == reflect.Slice {
-		return SliceDataOf(InterfaceDataOf(unsafe.Pointer(&v)).Data).Len
+		return SliceDataOf((*[]any)(InterfaceDataOf(&v).Data)).Len
 	}
 	// TODO: Should this panic?
 	return 0
@@ -415,13 +501,16 @@ var (
 			panic(fmt.Errorf("unknown bit size: %d", bits.UintSize))
 		}
 	}()
-	zeroData = func() unsafe.Pointer {
-		var v interface{} = []int{0}
-		id := InterfaceDataOf(unsafe.Pointer(&v))
-		sd := SliceDataOf(id.Data)
-		return sd.Data
-	}()
 )
+
+// MakeAt is like reflect.NewAt, but it returns the value, not a pointer
+// to the value.
+func MakeAt(t *Type, p unsafe.Pointer) (v any) {
+	id := InterfaceDataOf(&v)
+	atomic.StorePointer(&id.Type, *t.abiType())
+	atomic.StorePointer(&id.Data, p)
+	return
+}
 
 // MemoryOf exposes the bytes of a value as a byte slice.  Pass in
 // a pointer to the memory you want.
@@ -436,7 +525,7 @@ func typeAndMemoryOf(v interface{}) (t *Type, memory []byte) {
 	// at all points in time in case the runtime preempts the
 	// goroutine.
 	t = TypeOf(v)
-	id := InterfaceDataOf(unsafe.Pointer(&v))
+	id := InterfaceDataOf(&v)
 	// if t.ReflectType().Kind() == reflect.Pointer {
 	// 	data := id.Data
 	// 	atomic.StorePointer(&id.Data, zeroData)
@@ -444,7 +533,7 @@ func typeAndMemoryOf(v interface{}) (t *Type, memory []byte) {
 	// 	atomic.StorePointer(&id.Data, *(*unsafe.Pointer)(data))
 	// 	t = t.fieldUSRTypes()[0]
 	// }
-	sd := SliceDataOf(unsafe.Pointer(&memory))
+	sd := SliceDataOf(&memory)
 	atomic.StorePointer(&sd.Data, id.Data)
 	size := t.fieldUSRTypes()[0].Size()
 	atomicStoreInt(&sd.Cap, size)
@@ -458,8 +547,10 @@ type SliceData struct {
 	Cap  int
 }
 
-func SliceDataOf(v unsafe.Pointer) *SliceData {
-	return (*SliceData)(v)
+// SliceDataOf exposes the internal fields of a slice.  Manipulating
+// those fields manipulates the slice itself.
+func SliceDataOf[TSlice []T, T any](v *TSlice) *SliceData {
+	return (*SliceData)(unsafe.Pointer(v))
 }
 
 type StringData struct {
@@ -467,6 +558,67 @@ type StringData struct {
 	Len  int
 }
 
+// StringDataOf exposes the internal fields of a string.  Manipulating
+// those fields manipulates the passed-in string value.
 func StringDataOf(s *string) *StringData {
 	return (*StringData)(unsafe.Pointer(s))
+}
+
+var isNilFuncs = struct {
+	pointer func(p unsafe.Pointer) bool
+	slice   func(d SliceData) bool
+	iface   func(d InterfaceData) bool
+}{
+	pointer: func(p unsafe.Pointer) bool {
+		return p == nil
+	},
+	slice: func(d SliceData) bool {
+		return d == SliceData{}
+	},
+	iface: func(d InterfaceData) bool {
+		return d == InterfaceData{}
+	},
+}
+
+// IsNilFunc returns a function that can check if its value is nil.
+//
+// Ideally, this function implementation would just be:
+//
+//	func IsNilFunc[T any]() func(v T) bool {
+//		return func(v T) bool {
+//			return v == nil
+//		}
+//	}
+//
+// But that implementation produces this compiler error:
+//
+//	invalid operation: v == nil (mismatched types T and untyped nil)
+//
+// So IsNilFunc creates an IsNil function with the unsafe & reflect
+// packages.
+func IsNilFunc[T any]() func(v T) bool {
+	switch reflect.TypeFor[T]().Kind() {
+	case
+		reflect.Chan,
+		reflect.Func,
+		reflect.Map,
+		reflect.Pointer,
+		reflect.UnsafePointer:
+		// Compile-time check that these types are all the
+		// size of pointers:
+		_ = func() (x [1]struct{}) {
+			const ptrSize = unsafe.Sizeof(unsafe.Pointer(nil))
+			_ = x[int(ptrSize-unsafe.Sizeof((chan int)(nil)))]
+			_ = x[int(ptrSize-unsafe.Sizeof((func())(nil)))]
+			_ = x[int(ptrSize-unsafe.Sizeof((map[int]struct{})(nil)))]
+			//_ = x[int(ptrSize-unsafe.Sizeof(byte(0)))]
+			return
+		}
+		return *((*func(T) bool)(unsafe.Pointer(&isNilFuncs.pointer)))
+	case reflect.Slice:
+		return *((*func(T) bool)(unsafe.Pointer(&isNilFuncs.slice)))
+	case reflect.Interface:
+		return *((*func(T) bool)(unsafe.Pointer(&isNilFuncs.iface)))
+	}
+	return func(v T) bool { return false }
 }

@@ -259,3 +259,81 @@ func TestCopy(t *testing.T) {
 		)
 	}
 }
+
+func TestIsNil(t *testing.T) {
+	if unsafereflect.IsNilFunc[int]()(0) {
+		t.Fatalf("int(0) should not be nil")
+	}
+	if unsafereflect.IsNilFunc[any]()(0) {
+		t.Fatalf("any(int(0)) should not be nil")
+	}
+	if unsafereflect.IsNilFunc[any]()((*int)(nil)) {
+		t.Fatalf("any((int*)(nil)) should not be nil")
+	}
+	if !unsafereflect.IsNilFunc[any]()(nil) {
+		t.Fatalf("any(nil) should be nil")
+	}
+	if unsafereflect.IsNilFunc[chan int]()(make(chan int)) {
+		t.Fatalf("chan int should not be nil")
+	}
+	if !unsafereflect.IsNilFunc[chan int]()(nil) {
+		t.Fatalf("(chan int)(nil) should be nil")
+	}
+	if unsafereflect.IsNilFunc[func()]()(func() {}) {
+		t.Fatalf("func() {} should not be nil")
+	}
+	if !unsafereflect.IsNilFunc[func()]()(nil) {
+		t.Fatalf("(func() {})(nil) should be nil")
+	}
+	if unsafereflect.IsNilFunc[map[int]int]()(make(map[int]int)) {
+		t.Fatalf("map[int]int{} should not be nil")
+	}
+	if !unsafereflect.IsNilFunc[map[int]int]()(nil) {
+		t.Fatalf("map[int]int(nil) should be nil")
+	}
+	if unsafereflect.IsNilFunc[[]int]()(make([]int, 0)) {
+		t.Fatalf("[]int{} should not be nil")
+	}
+	if unsafereflect.IsNilFunc[[]int]()([]int{}) {
+		t.Fatalf("[]int{} should not be nil")
+	}
+	if !unsafereflect.IsNilFunc[[]int]()(nil) {
+		t.Fatalf("[]int(nil) should be nil")
+	}
+	if unsafereflect.IsNilFunc[string]()("") {
+		t.Fatalf("\"\" should not be nil")
+	}
+}
+
+func TestReflecting(t *testing.T) {
+	var a any = int(123)
+	urt := unsafereflect.TypeOf(a)
+	length := urt.Len()
+	if length != 0 {
+		t.Fatalf("expected length %d, not %d for %T", 0, length, a)
+	}
+	length = len(urt.ReflectStructFields())
+	if length != 0 {
+		t.Fatalf("expected %d fields, not %d for %T", 0, length, a)
+	}
+	a = struct{ i int }{a.(int)}
+	urt = unsafereflect.TypeOf(a)
+	length = urt.Len()
+	if length != 1 {
+		t.Fatalf("expected length %d, not %d for %T", 1, length, a)
+	}
+	length = len(urt.ReflectStructFields())
+	if length != 1 {
+		t.Fatalf("expected %d fields, not %d for %T", 1, length, a)
+	}
+	a = [17]int{0: a.(struct{ i int }).i}
+	urt = unsafereflect.TypeOf(a)
+	length = urt.Len()
+	if length != 17 {
+		t.Fatalf("expected length %d, not %d for %T", 17, length, a)
+	}
+	length = len(urt.ReflectStructFields())
+	if length != 1 {
+		t.Fatalf("expected %d fields, not %d for %T", 1, length, a)
+	}
+}
