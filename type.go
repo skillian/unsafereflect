@@ -90,26 +90,32 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 	}()
 	numFields := 0
 	initFuncs := make([]func(t *Type), 0, 2)
-	switch rt.Kind() {
+	handleArraySliceAndPointer := func(t *Type) {
+		elemType := TypeFromReflectType(t.ReflectType().Elem())
+		sfs := t.ReflectStructFields()
+		sfs[0] = reflect.StructField{
+			Name: "Elem",
+			Type: elemType.ReflectType(),
+		}
+		t.fieldABITypes()[0] = *elemType.abiType()
+		t.ptrToFieldABITypes()[0] = *elemType.abiPtrType()
+		t.fieldUSRTypes()[0] = elemType
+		t.ptrToFieldUSRTypes()[0] = TypeFromReflectType(reflect.PointerTo(elemType.ReflectType()))
+	}
+	kind := rt.Kind()
+	switch kind {
 	case reflect.Array:
+		numFields++
 		initFuncs = append(initFuncs, func(t *Type) {
 			t.uintData[0] = (uint(t.ReflectType().Len()) << uintDataBits) | udIsArrayMask
 		})
-		fallthrough
+		initFuncs = append(initFuncs, handleArraySliceAndPointer)
 	case reflect.Slice, reflect.Pointer:
-		// elem type
 		numFields++
 		initFuncs = append(initFuncs, func(t *Type) {
-			elemType := TypeFromReflectType(t.ReflectType().Elem())
-			t.ReflectStructFields()[0] = reflect.StructField{
-				Name: "Elem",
-				Type: elemType.ReflectType(),
-			}
-			t.fieldABITypes()[0] = *elemType.abiType()
-			t.ptrToFieldABITypes()[0] = *elemType.abiPtrType()
-			t.fieldUSRTypes()[0] = elemType
-			t.ptrToFieldUSRTypes()[0] = TypeFromReflectType(reflect.PointerTo(elemType.ReflectType()))
+			t.uintData[0] |= udIsArrayMask | udHasLenMask
 		})
+		initFuncs = append(initFuncs, handleArraySliceAndPointer)
 	case reflect.Struct:
 		// field types + ptr to field types
 		numFields += rt.NumField()
@@ -120,9 +126,9 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 			fieldUSRTypes := t.fieldUSRTypes()
 			ptrToFieldUSRTypes := t.ptrToFieldUSRTypes()
 			rt := t.ReflectType()
-			numFields := t.numFields()
+			numTypes := t.numTypes()
 			reflectStructFields := t.ReflectStructFields()
-			for i := 0; i < numFields; i++ {
+			for i := 0; i < numTypes; i++ {
 				reflectStructFields[i] = rt.Field(i)
 				fieldUSRTypes[i] = TypeFromReflectType(reflectStructFields[i].Type)
 				ptrToFieldABITypes[i] = *fieldUSRTypes[i].abiPtrType()
@@ -154,24 +160,8 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 	if v, loaded := types.LoadOrStore(key, t); loaded {
 		return v.(*Type)
 	}
-	tReflectStructFields := t.ReflectStructFields()
-	tvReflectStructFields := tv.Elem().Field(2).Slice(0, numFields).Interface().([]reflect.StructField)
-	if len(tReflectStructFields) != len(tvReflectStructFields) {
-		panic(fmt.Sprintf(
-			"len(tReflectStructFields) (%d) != "+
-				"len(tvReflectStructFields) (%d)",
-			len(tReflectStructFields),
-			len(tvReflectStructFields),
-		))
-	}
-	if len(tReflectStructFields) > 0 && &tReflectStructFields[0] != &tvReflectStructFields[0] {
-		panic(fmt.Sprintf(
-			"&tReflectStructFields[0] (%p) != "+
-				"&tvReflectStructFields[0] (%p) = (%x)",
-			&tReflectStructFields[0],
-			&tvReflectStructFields[0],
-			uintptr(unsafe.Pointer(&tvReflectStructFields[0]))-uintptr(unsafe.Pointer(&tReflectStructFields[0])),
-		))
+	for _, initFunc := range initFuncs {
+		initFunc(t)
 	}
 	fieldABITypes := t.fieldABITypes()
 	ptrToFieldABITypes := t.ptrToFieldABITypes()
@@ -190,8 +180,24 @@ func TypeFromReflectType(rt reflect.Type) (t *Type) {
 	if len(ptrToFieldUSRTypes) != numTypes {
 		panic("len(ptrToFieldUSRTypes) != t.numTypes")
 	}
-	for _, initFunc := range initFuncs {
-		initFunc(t)
+	tReflectStructFields := t.ReflectStructFields()
+	tvReflectStructFields := tv.Elem().Field(2).Slice(0, t.numTypes()).Interface().([]reflect.StructField)
+	if len(tReflectStructFields) != len(tvReflectStructFields) {
+		panic(fmt.Sprintf(
+			"len(tReflectStructFields) (%d) != "+
+				"len(tvReflectStructFields) (%d)",
+			len(tReflectStructFields),
+			len(tvReflectStructFields),
+		))
+	}
+	if len(tReflectStructFields) > 0 && &tReflectStructFields[0] != &tvReflectStructFields[0] {
+		panic(fmt.Sprintf(
+			"&tReflectStructFields[0] (%p) != "+
+				"&tvReflectStructFields[0] (%p) = (%x)",
+			&tReflectStructFields[0],
+			&tvReflectStructFields[0],
+			uintptr(unsafe.Pointer(&tvReflectStructFields[0]))-uintptr(unsafe.Pointer(&tReflectStructFields[0])),
+		))
 	}
 	return
 }
@@ -212,7 +218,7 @@ func (t *Type) FieldType(fieldIndex int) *Type {
 // Len gets the number of fields if the Type is a struct or the number
 // of elements if it is an array.  Otherwise, the return value is
 // undefined.
-func (t *Type) Len() int { return t.numFields() }
+func (t *Type) Len() int { return int(t.uintData[0] >> uintDataBits) }
 
 // ReflectStructFields returns a borrowed slice of reflect.StructField
 // of all of the type's struct fields.  Do not mutate the elements of
@@ -221,10 +227,10 @@ func (t *Type) Len() int { return t.numFields() }
 // array or slice.
 func (t *Type) ReflectStructFields() []reflect.StructField {
 	ups := t.unsafePointers()
-	numFields := t.numFields()
+	numTypes := t.numTypes()
 	return unsafe.Slice(
-		(*reflect.StructField)(unsafe.Add(unsafe.Pointer(ups), (2+numFields*typeUnsafePointers)*int(unsafe.Sizeof(unsafe.Pointer(nil))))),
-		numFields,
+		(*reflect.StructField)(unsafe.Add(unsafe.Pointer(ups), (2+numTypes*typeUnsafePointers)*int(unsafe.Sizeof(unsafe.Pointer(nil))))),
+		numTypes,
 	)
 }
 
@@ -276,7 +282,7 @@ func (t *Type) field(
 		base = SliceDataOf((*[]any)(strucID.Data)).Data
 	}
 	fID := InterfaceDataOf(&field)
-	atomic.StorePointer(&fID.Type, fieldTypesSelector(t)[fieldIndex*t.fieldIndexMultiplier()])
+	atomic.StorePointer(&fID.Type, fieldTypesSelector(t)[fieldIndex&^t.notFieldLengthMask()])
 	atomic.StorePointer(
 		&fID.Data,
 		unsafe.Add(base, t.fieldOffset(fieldIndex)),
@@ -298,25 +304,27 @@ func (t *Type) fieldABITypes() []unsafe.Pointer {
 	return unsafe.Slice(t.unsafePointers(), 2+numTypes)[2:]
 }
 
-// fieldIndexMultiplier is either 0 for array and slice types or 1 for
-// struct types.  For arrays and slices, there is only one field
+// notFieldLengthMask is:
+//
+//	-1 for array and slice types or
+//	0 for struct types.
+//
+// For arrays and slices, there is only one field
 // defined in the Type, so when you access the field information for
-// index 100, it accesses fieldInfo[100*fieldMultiplier] = fieldInfo[0]
-func (t *Type) fieldIndexMultiplier() int {
-	return int((t.uintData[0] >> udHasLenBit) & 1)
+// index 100, it accesses fieldInfo[100&^notFieldLengthMask] = fieldInfo[0]
+func (t *Type) notFieldLengthMask() int {
+	return int((t.uintData[0]&udHasLenMask)>>udHasLenBit) - 1
+}
+func (t *Type) notArrayLengthMask() int {
+	return int((t.uintData[0]&udIsArrayMask)>>udIsArrayBit) - 1
 }
 
 func (t *Type) fieldOffset(i int) int {
-	m := t.fieldIndexMultiplier()
-	notM := int((^m) & 1)
-	// either the left or the right side of the + is zero:
-	// for arrays and slices, the left side is zero and we calculate
-	// the offset on the right.
-	// for structs, the left is non-zero and the right is zero.
-	// I did it this way to eliminate branching to (hopefully) make
-	// field access as fast as possible.  It's only a few lines, so
-	// I'm not sorry for it being a bit complicated.
-	return int(t.ReflectStructFields()[i*m].Offset) + (i*notM)*t.fieldUSRTypes()[0].size
+	fieldLengthMask := ^t.notFieldLengthMask()
+	arrayLengthMask := ^t.notArrayLengthMask()
+	sliceLengthMask := fieldLengthMask & arrayLengthMask
+	return int(t.ReflectStructFields()[i&(fieldLengthMask^sliceLengthMask)].Offset) +
+		t.fieldUSRTypes()[0].size*(i&(arrayLengthMask|sliceLengthMask))
 }
 
 func (t *Type) fieldUSRTypes() []*Type {
@@ -325,8 +333,16 @@ func (t *Type) fieldUSRTypes() []*Type {
 	return unsafe.Slice(ptrs, 2+(usrPtrType*numTypes))[2+(usrType*numTypes):]
 }
 
-func (t *Type) numFields() int { return int(t.uintData[0] >> uintDataBits) }
-func (t *Type) numTypes() int  { return (t.numFields()-1)*t.fieldIndexMultiplier() + 1 }
+// numTypes returns 1 for arrays and slices (the element type) or
+// the number of fields.
+func (t *Type) numTypes() int {
+	length := t.Len()
+	fieldLengthMask := ^t.notFieldLengthMask()
+	arrayLengthMask := ^t.notArrayLengthMask()
+	pointerIndexMask := fieldLengthMask & arrayLengthMask
+	return (length & (fieldLengthMask ^ pointerIndexMask)) +
+		(1 & (arrayLengthMask | pointerIndexMask))
+}
 
 func (t *Type) ptrToFieldABITypes() []unsafe.Pointer {
 	numTypes := t.numTypes()
@@ -387,10 +403,10 @@ func appendFields(
 		if structKind == reflect.Slice {
 			base = SliceDataOf((*[]any)(base)).Data
 		}
-		m := structType.fieldIndexMultiplier()
+		m := (^structType.notFieldLengthMask()) & structType.notArrayLengthMask()
 		for i, length := 0, Len(st); i < length; i++ {
 			id.Data = unsafe.Add(base, structType.fieldOffset(i))
-			id.Type = types[i*m]
+			id.Type = types[i&m]
 			slice = append(slice, v)
 		}
 	}
@@ -453,8 +469,11 @@ func InterfaceDataOf[T any](v *T) *InterfaceData {
 // of a struct.
 func Len(v interface{}) int {
 	t := TypeOf(v)
-	if t.uintData[0]&(udIsArrayMask|udHasLenMask) != 0 {
-		return t.numFields()
+	ud := t.uintData[0]
+	a := (ud & udIsArrayMask) >> udIsArrayBit
+	b := (ud & udHasLenMask) >> udHasLenBit
+	if (a ^ b) != 0 {
+		return t.Len()
 	}
 	if t.ReflectType().Kind() == reflect.Slice {
 		return SliceDataOf((*[]any)(InterfaceDataOf(&v).Data)).Len
